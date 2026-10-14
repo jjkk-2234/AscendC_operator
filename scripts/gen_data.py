@@ -48,8 +48,15 @@
     python3 scripts/gen_data.py --zero-point
 
 运行算子时命令行参数必须与这里一致：
-    ./build.sh run <M> <N> [tileLength] [l2_cache] [double_buffer]
+    ./build.sh run <M> <N> [tileLength] [l2] [db] [group]
     （等价于直接跑 ./build/dequant <M> <N> ...；可执行文件名来自 dequant.asc）
+    ★ --m/--n 必须和 run 的前两个参数相同，否则 host 侧 ReadFile 会报"大小不符"
+      并直接退出（报的是期望/实际字节数，容易误以为是数据文件坏了）。
+    l2 / db / group 是三个正交开关：
+      l2    非 0 = 关闭 xGm 的 L2 Cache
+      db    非 0 = 启用双缓冲（x/y 各 2 份 buffer）
+      group > 0 = 每批一次搬 group 行（GROUP 打包）
+    ★ 建议先跑 group=1 验证 pitch/stride 推导是否正确（成本最低），再扫 group=2/4/8。
 """
 
 import argparse
@@ -168,6 +175,12 @@ def main():
     if args.zero_point:
         print("  ⚠️ 已生成 input_zp.bin，但当前 dequant.asc 只实现了对称量化（y = x*scale），")
         print("     尚未做 (x - zp) —— 直接验证会失败。要用请先在 kernel 里加一次 Sub。")
+    # ★ 非对齐提示：verify_result.py 的归因规则里有一条"错误分布较散 ⇒ 先查非对齐路径"，
+    #   这里提前告诉用户本次数据是不是非对齐用例，免得看到报错一头雾水。
+    if (N * 4) % 32 != 0:
+        print("  ℹ️ 本次 N=%d ⇒ 每行 %d 字节不是 32B 的倍数（非对齐用例）。" % (N, N * 4))
+        print("     这是**故意**的：用于覆盖 DataCopyPad 的尾块/补齐路径。")
+        print("     若结果错误，优先查行步长 pitch 是否按 (actualTileLength*4+31)/32*32 算的。")
     return 0
 
 

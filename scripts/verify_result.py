@@ -20,11 +20,16 @@ shape / dtype 从 golden 同目录的 shape.txt 读取（由 gen_data.py 写入�
     python3 scripts/verify_result.py a.bin b.bin --rtol 1e-5 --atol 1e-5
     python3 scripts/verify_result.py a.bin b.bin --max-print 5
 
-失败时会额外给出"错在哪"的提示：
-  * 错误集中在少数几列   -> 大概率 scale 的**通道索引**错了
-  * 错误铺满所有行同列   -> 广播没生效（每行没有复用同一份 scale）
-  * 错误集中在少数几行   -> 分核/尾块的**行边界**错了
-  * 整片偏移 1 个元素    -> 搬运的长度或起始地址错了
+失败时会额外给出"错在哪"的提示（按错误分布归因）：
+  * 错误集中在少数列且铺满所有行  -> 大概率 scale 的**通道索引**错了
+  * 错误集中在少数行              -> 分核/尾块的**行边界**错了
+  * 全片都错                      -> 广播没生效，或搬运长度/起始地址错了
+  * 错得很散（尤其 N 非 8 倍数时） -> 优先查 **pitch**：
+        GROUP 版里 DataCopyPad 会把每个 blockLen **补齐到 32B**（不是补到 tileLength），
+        所以 "行首偏移" 必须用 pitch = (actualTileLength*4+31)/32*32/4，
+        而 "计算长度" 用 actualTileLength。混用会让第 2 行起整体错位 4 字节。
+        验证技巧：先用 group=1 跑一次（rows 恒为 1，但 pitch 推导同样生效），
+        如果 group=1 就对、group>1 才错，基本可以锁定是 pitch/stride 的问题。
 """
 
 import argparse
@@ -136,7 +141,12 @@ def main():
             print("  → 全片都错：**广播可能没生效**（每行没有复用同一份 scale），"
                   "或搬运长度 / 起始地址错了")
         else:
-            print("  → 分布较散：先查非对齐路径（N 不是 8 的倍数时必须用 DataCopyPad）")
+            print("  → 分布较散：先查**非对齐路径**。GROUP 版重点查 pitch：")
+            print("     DataCopyPad 把每个 blockLen 补齐到 **32B**（不是补到 tileLength）⇒")
+            print("       行首偏移用 pitch = (actualTileLength*4+31)/32*32/4")
+            print("       计算长度用 actualTileLength")
+            print("     混用会让第 2 行起整体错位 4 字节。")
+            print("     快速定位：跑 group=1 对比 —— group=1 对、group>1 错 ⇒ 基本就是 pitch/stride。")
 
     # ------------------------------------------------------------------ 判定
     if args.strict:

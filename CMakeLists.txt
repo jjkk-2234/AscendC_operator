@@ -39,15 +39,39 @@ cmake_minimum_required(VERSION 3.16)
 set(CMAKE_ASC_RUN_MODE "npu" CACHE STRING "Run mode: npu, cpu, sim")
 set(CMAKE_ASC_ARCHITECTURES "dav-2201" CACHE STRING "NPU architecture: dav-2201, dav-3510")
 
+# ---------------------------------------------------------------------------
+# 【更新】msSanitizer 开关（默认 OFF ⇒ 日常编译完全不受影响）
+#
+# 打开方式（**强烈建议用独立 build 目录**，见 build.sh 的 san 子命令）：
+#     cmake -S . -B build-san -DENABLE_SANITIZER=ON && cmake --build build-san -j
+#
+# 打开后做的事：给 .asc 编译加 --sanitizer -lineinfo（-g 本来就有）。
+# 之后用 mssanitizer 跑那个二进制：
+#     mssanitizer --tool=memcheck,initcheck ./build-san/dequant 8175 7775 2048 0 1 8
+#
+# ⚠️ 两个必须知道的约束：
+#   1) 不能用 -O0（ai_core_operator_compilation.md:114）⇒ 下面有兜底把它设成 RelWithDebInfo
+#   2) 开启后 GlobalTensor **强制走 L2**，AscendC::SetL2CacheHint 失效（同一条出处）
+#      ⇒ "l2=1 的收益"必须用**不带 sanitizer** 的二进制来测
+# ---------------------------------------------------------------------------
+set(ENABLE_SANITIZER "OFF" CACHE BOOL
+    "开启 msSanitizer 检测（编译加 --sanitizer -lineinfo）")
+
+find_package(ASC REQUIRED)
+
+project(kernel_samples LANGUAGES ASC CXX)
+
+# 【更新】sanitizer 不能在 -O0 场景下使用（ai_core_operator_compilation.md:114）
+#   CMake 默认不给 CMAKE_BUILD_TYPE 时相当于不带优化 ⇒ 这里兜底成 RelWithDebInfo（带 -O2 -g）
+if(ENABLE_SANITIZER AND NOT CMAKE_BUILD_TYPE)
+    set(CMAKE_BUILD_TYPE "RelWithDebInfo" CACHE STRING "" FORCE)
+endif()
+
 # ===========================================================================
 # ★ 选择源文件（每次只编一个，改这一行即可）
 # ===========================================================================
 set(DEQ_SRC "dequant.asc")
 # ===========================================================================
-
-find_package(ASC REQUIRED)
-
-project(kernel_samples LANGUAGES ASC CXX)
 
 if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/${DEQ_SRC}")
     message(FATAL_ERROR
@@ -63,13 +87,24 @@ message(STATUS "  源文件     : ${DEQ_SRC}")
 message(STATUS "  可执行文件 : ${DEQ_NAME}")
 message(STATUS "  运行模式   : ${CMAKE_ASC_RUN_MODE}")
 message(STATUS "  架构       : ${CMAKE_ASC_ARCHITECTURES}")
+# 【更新】把 sanitizer 状态打出来 —— 否则很容易"以为开了其实没开"
+if(ENABLE_SANITIZER)
+    message(STATUS "  Sanitizer  : ON   (--sanitizer -lineinfo, build type = ${CMAKE_BUILD_TYPE})")
+    message(STATUS "               ⚠️ 此二进制 GlobalTensor 强制走 L2，SetL2CacheHint 失效")
+    message(STATUS "               ⚠️ 测性能请用不带 sanitizer 的 build/")
+else()
+    message(STATUS "  Sanitizer  : OFF  (日常编译；要检测用 ./build.sh san)")
+endif()
 message(STATUS "==========================================================")
 
 add_executable(${DEQ_NAME} ${DEQ_SRC})
 
+# 【更新】--sanitizer 只在 ENABLE_SANITIZER=ON 时加（默认 OFF ⇒ 日常编译零影响）
 target_compile_options(${DEQ_NAME} PRIVATE
     $<$<COMPILE_LANGUAGE:ASC>:--npu-arch=${CMAKE_ASC_ARCHITECTURES}>
     $<$<COMPILE_LANGUAGE:ASC>:-g>
+    $<$<COMPILE_LANGUAGE:ASC>:$<$<BOOL:${ENABLE_SANITIZER}>:--sanitizer>>
+    $<$<COMPILE_LANGUAGE:ASC>:$<$<BOOL:${ENABLE_SANITIZER}>:-lineinfo>>
 )
 
 # ---------------------------------------------------------------------------
