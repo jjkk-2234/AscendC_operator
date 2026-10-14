@@ -31,7 +31,7 @@ chmod +x build.sh
 | 1 | `M` | 1024 | 行数 |
 | 2 | `N` | 1024 | 列数（= scale 长度） |
 | 3 | `tileLength` | `min(2048,N)` 向上取整到 8 | 列方向一个 tile 的元素数 |
-| 4 | **`l2`** | 0 | **非 0 = 关闭 `xGm` 的 L2 Cache**（L2 优化开关） |
+| 4 | **`l2`** | 0 | 非 0 = **关闭 `xGm` 的 L2 Cache**（L2 优化开关）<br>⚠️ **大 shape 才有正收益**（−23%）；小 shape 反而变慢（+8.2%）——判据见 ④ Step 4 |
 | 5 | **`db`** | 0 | 非 0 = 启用**双缓冲**（Ping/Pong，x/y 各 2 份） |
 | 6 | **`group`** | 0 | **0 = 不用 GROUP 版**；>0 = 每批一次搬 `group` 行 |
 
@@ -96,6 +96,87 @@ chmod +x build.sh
 **为什么需要它**：`LocalMemAllocator::Alloc()` **没有任何边界检查**（就是一句 `head_ += ...`），
 所以 UB 越界里有很大一类是**静默错**（踩到相邻 tensor、不报错、结果随机错）——
 `CheckUbBudget` 是 Host 端的提前防线，msSanitizer 是上板后的兜底验证。
+
+#### 实战案例：抓到一个真实的 UB 越界（已验证）
+
+**背景**：为了检验 msSanitizer 到底能不能抓到 UB 溢出，**故意把 `main` 里的 `CheckUbBudget` 注释掉**，
+再传一组必定越界的参数：
+
+```bash
+./build.sh san 8175 7775 8192 1 1 10     # tile=8192, group=10
+```
+
+**报错原文**：
+
+```
+====== ERROR: illegal write of size 31104
+======    at 0xa0000 on UB in "dequant_custom_group_double_buffer(...)"
+======    in block aiv(0-39) on device 0
+======    code in pc current 0xfb1c (serialNo:21)
+======    #0 /home/workspace/cxd/dequant_asc/dequant.asc:420:13    ← ★ 越界的源码行
+======    #1 /home/workspace/cxd/dequant_asc/dequant.asc:529:8     ← 调用者（kernel 入口）
+```
+
+**逐项对照 —— 数字全部对得上**：
+
+| 报错信息 | 含义 | 推算验证 |
+|---|---|---|
+| `at 0xa0000` | UB 偏移 **655360 B** | `xPing + xPong = 2 × 10 × 8192 = 163840 元素 = 655360 B` ✅ **正是 `sLocal` 的起点** |
+| `write of size 31104` | 写入 **31104 B** | `N×4 = 7775×4 = 31100`，补到 32B 对齐 = **31104** ✅ **正是 `sLocal` 的 `DataCopyPad`** |
+| `in block aiv(0-39)` | **40 个核全部越界** | 每个核的 `Alloc` 都一样 ⇒ 必然同时越界 ✅ |
+
+**按 `Alloc` 顺序还原地址布局**（`group=10, tileLength=8192, pitch=tileLength`）：
+
+```
+xLocalPing  elems= 81920  bytes=[       0,  327680)
+xLocalPong  elems= 81920  bytes=[  327680,  655360)
+sLocal      elems=  8192  bytes=[  655360,  688128)   ← ★ 报错 0xa0000 就在这里
+yLocalPing  elems= 81920  bytes=[  688128, 1015808)
+yLocalPong  elems= 81920  bytes=[ 1015808, 1343488)
+                                   合计 = 1312 KB   而 UB 只有 192 KB ⇒ 超 6.8 倍
+```
+
+**⇒ 结论**：`xPing + xPong` 就把地址推到了 640 KB，**远超 UB 的 192 KB**，
+所以轮到 `sLocal` 时 `DataCopyPad` 写的是一个**完全在 UB 之外**的地址。
+
+**这个案例说明三件事**：
+
+| # | 结论 |
+|---|---|
+| **1** | **msSanitizer 能精确抓"跑到 UB 之外"这类越界** —— 给出地址、大小、**源码行号、调用栈、涉及哪些核** |
+| **2** | **`CheckUbBudget` 确实拦得住它** —— 它算 `units × tileLength × 4B = 41 × 8192 × 4 = 1312 KB > 192 KB` 会直接 `return -1`。**这个案例是"故意注释掉校验"才复现的** |
+| **3** | ⚠️ **两类越界的可检测性不同**（见下表） |
+
+#### 两类 UB 越界：可检测性差别很大
+
+| 越界类型 | 表现 | `memcheck` 能抓吗 |
+|---|---|---|
+| **跑到 UB 窗口之外**（如本案例） | 访问的是**非法地址空间** | ✅ **能抓**（`illegal read/write`） |
+| **踩到相邻 tensor**（仍在 UB 内） | 从地址空间看**完全合法** | ❌ **可能不报** —— bump 分配器没有边界元数据，memcheck 无从判断 |
+
+**⇒ 所以防线要分两层**：
+
+| 层 | 手段 | 抓什么 |
+|---|---|---|
+| **Host 端（第一道）** | **`CheckUbBudget`** | **总容量超限** —— 最可靠，能在启动前就拒绝 |
+| **上板后（兜底）** | **`memcheck` + `initcheck` + `verify_result.py --strict`** | 跑到 UB 外 + **读到脏数据**（相邻 tensor 踩踏的典型症状） |
+
+> 💡 **`--strict` 是被低估的一环**：`verify_result.py` 默认允许 `1e-4` 比例的不一致（`DEFAULT_ERROR_TOL`），
+> 会**掩盖轻微的随机踩踏**。查越界时一定要用 `./build.sh verify` 前加 `--strict`（或直接跑
+> `python3 scripts/verify_result.py a.bin b.bin --strict`）。
+
+**完整检测流程（想主动验证越界时）**：
+
+```bash
+# ① 临时注释掉 main 里的 CheckUbBudget（否则会被提前拦住，测不到）
+#    if (CheckUbBudget(...) != 0) { return -1; }      ← 注释这一行
+
+# ② 传一组必定越界的参数（超 UB 上限）
+./build.sh san 8175 7775 8192 1 1 10
+
+# ③ 看完报告后，恢复 CheckUbBudget，并用合法参数复测一次确认干净
+./build.sh san 8175 7775 1024 1 1 10        # 41 × 1024 × 4 = 164 KB < 192 KB ✓
+```
 
 ### ① 上板：编译 → 造数 → 跑 → 校验
 
@@ -324,18 +405,73 @@ xGm.SetL2CacheHint(AscendC::CacheMode::CACHE_MODE_DISABLE);
 API 见 [SetL2CacheHint.md](<asc-devkit/docs/zh/api/SIMD-API/basic_api/data_structures/GlobalTensor/SetL2CacheHint.md#L81>)（**A2 系列支持** ✓）。
 
 ```bash
-./build.sh prof 8175 7775 2048 0 1 8      # 基准：group+db
-./build.sh prof 8175 7775 2048 1 1 8      # 加上 L2 优化
+./build.sh prof 8175 7775 2048 0 1 5      # x 走 L2（基准）
+./build.sh prof 8175 7775 2048 1 1 5      # x 不走 L2
 ```
 
-> **验证指标**：`L2Cache.csv` 的 `aiv_write_hit_rate(%)`（现在 27.1）应**上升**；
-> `aiv_read_hit_rate(%)`、`aiv_total_hit_rate(%)` 看好坏。
-> 同时看 `Memory.csv` 的 `aiv_gm_to_ub_bw(GB/s)`（和官方给的关注项一致）。
->
-> **⚠️ 编译期坑**：用 `--sanitizer` 时 GlobalTensor 会**强制走 L2**，本接口失效
-> （[ai_core_operator_compilation.md:114](<asc-devkit/docs/zh/guide/programming_guide/compilation_and_execution/operator_compilation/ai_core_operator_compilation.md#L114>)）⇒ 别在 sanitizer 下测这项。
->
-> **状态**：代码已就绪，**性能数据待采**。
+#### ✅ 实测结论：**大 shape 下是正优化（−23.0%），小 shape 下是负优化**
+
+**大 shape（8175×7775，tile=2048, db=1, group=5）—— 真实负载**
+
+| 指标 | L2 **开启**（`l2=0`） | L2 **关闭**（`l2=1`） | 关闭 vs 开启 |
+|---|---|---|---|
+| **Task Duration** | 378.17 μs | **291.37 μs** | **−23.0%** ✅ **变快** |
+| `aiv_time` | 372.86 | 284.54 | −23.7% |
+| MTE2 | 369.77 | 281.59 | −23.8% |
+| **MTE3** | 150.59 | **103.08** | **−31.5%** ✅ |
+| **VEC** | 61.905 | **61.905** | **0.0%** ✓（对照干净） |
+| `MTE2 active_bw` | 16.09 GB/s | **21.13** | **+31.3%** |
+| `MTE3 active_bw` | 49.19 | **72.07** | **+46.5%** |
+| 搬运字节 / 笔数 | — | — | **完全不变** |
+| `L2 read_hit` | 5.62% | 0.47% | −5.15 pt |
+| `L2 write_hit` | 14.81% | **15.58%** | **+0.77 pt** ↑ |
+
+**小 shape（1015²，tile=1024, db=1, group=8）—— 反例**
+
+| 指标 | 开启 | 关闭 | 关闭 vs 开启 |
+|---|---|---|---|
+| **Task Duration** | 10.300 μs | 11.140 μs | **+8.2%** ❌ 变慢 |
+| MTE2 | 5.892 | 6.803 | +15.5% |
+| VEC | 1.456 | 1.456 | 0% |
+| `MTE2 active_bw` | 17.25 | 14.94 | −13.4% |
+| `L2 read_hit` | 14.05% | 3.85% | −10.20 pt |
+
+#### 机制：**判据是「x 的数据量 vs L2 容量」**
+
+```
+大 shape：x = 8175 × 7775 × 4B ≈ 254 MB   ≫ L2 容量（MB 级）
+  ⇒ 把 x 放进 L2 毫无收益（读命中率本来就低），
+     反而会把 L2 里 y 的写回数据冲掉
+  ⇒ 关掉 x 的 L2 后：L2 留给 y ⇒ 写命中率 ↑（14.81→15.58）
+                               ⇒ MTE3 带宽 +46.5%、MTE2 带宽 +31.3%
+  ⇒ 总时间 −23.0% ✅
+
+小 shape：x = 1015 × 1015 × 4B ≈ 4 MB    ≪ L2 容量
+  ⇒ x 能整个装进 L2，读命中率有 14.05% —— L2 对它是**真有缓存价值**的
+  ⇒ 关掉等于丢掉这份收益 ⇒ 变慢 +8.2% ❌
+```
+
+**⇒ 这正好解释了官方 add 样例为什么能关**：它是 `8192²`（256 MB，**装不进 L2**），
+与你的**大 shape 同类**、与**小 shape 不同类** ✓
+
+#### 采用的结论
+
+| 项 | 结论 |
+|---|---|
+| **大 shape（真实负载）** | **用 `l2=1`** —— 378.17 → **291.37 μs（−23.0%）** |
+| **小 shape** | `l2=0` 更好，但**不代表真实场景**（数据全装得进 L2 是特例） |
+| **判据** | 用 `M*N*4` 和 L2 容量比：**远大于 L2 ⇒ 关；小于 L2 ⇒ 别关** |
+| **当前最优组合** | **`l2=1 db=1 group=5`（大 shape）** ⇒ 291 μs，相比旧码 742 μs 快了 **2.5×** |
+
+> **⚠️ 编译期坑**：用 `--sanitizer` 时 GlobalTensor 会**强制走 L2**，`SetL2CacheHint` 失效
+> （[ai_core_operator_compilation.md:114](<asc-devkit/docs/zh/guide/programming_guide/compilation_and_execution/operator_compilation/ai_core_operator_compilation.md#L114>)）
+> ⇒ **`l2=1` 的收益必须用 `build/`（不带 sanitizer）来测**，`build-san/` 测不出来。
+
+#### 「小 shape 是负优化」这条为什么重要
+
+它是一个**活的反例**：说明"关掉只读一次的 tensor 的 L2"**不是无条件正确的**。
+如果只测小 shape，会得出"L2 优化有害"的错误结论；如果只测大 shape，又会错过"装得下时不该关"这个边界。
+**两个 shape 都测，才拿到完整的适用条件。**
 
 #### 优化路径汇总
 
@@ -344,8 +480,12 @@ API 见 [SetL2CacheHint.md](<asc-devkit/docs/zh/api/SIMD-API/basic_api/data_stru
 | Step 0 baseline | `0 0 0`（旧版 i 外 j 内） | 742 μs（旧码） | `read_main` 205 KB（s 重复读） |
 | Step 1 scale 常驻 | `0 0 0`（换序后） | 725.39 μs | `read_main` 107.8 KB（−47.5%） |
 | Step 2 双缓冲 | `0 1 0` | **484.23 μs** | `Σ/T` 1.644→2.002；达成率 30%→46% |
-| Step 3 GROUP | `0 0 8` / `0 1 8` | 待采 | 看 `aiv_mte2_instructions` ÷8 |
-| Step 4 L2 | `1 1 8` | 待采 | 看 `L2Cache.csv` 写命中率 ↑ |
+| Step 3 GROUP | `0 1 5` | 291~378 μs 量级 | `aiv_mte2_instructions` 817→169（GROUP=5） |
+| **Step 4 L2** | **`1 1 5`** | **291.37 μs（−23.0%）** | MTE2/MTE3 带宽 +31%/+46%，字节数不变 |
+
+> **注意 Step 3 与 Step 4 用的是 `group=5` 而不是 `8`** —— 因为 `tileLength=2048` 时
+> `units = 4g+1` 要满足 `units × 2048 × 4B ≤ 192KB` ⇒ `g ≤ 5`（见 ⑤-4 的 UB 预算）。
+> `group=8` 只在 `tileLength ≤ 1024` 时可行。
 
 **还有一个"不能做"的优化方向**（避免走弯路）：
 
@@ -898,7 +1038,9 @@ AscendDequant(dst, src, scale, {rowLen, colLen, scaleSize});          // A2/A3
 - [ ] **flag 收支配平**：预置数 = 排空数；`SetFlag<V_MTE2>` 的释放要等**本 j 所有行**都算完
 - [ ] 采一次 `PipeUtilization`，算 `Σ/T`（判断双缓冲是否生效）
 - [ ] 采一次 `Memory.csv` 的 `aiv_mte2_instructions`（判断 GROUP 是否生效）
-- [ ] `l2=1` / `l2=0` 各采一次，比 `L2Cache.csv` 的写命中率
+- [ ] `l2=1` / `l2=0` 各采一次：**两个 shape 都要测**（判据是 `M*N*4` vs L2 容量，见 ④ Step 4）
+- [ ] **`CheckUbBudget` 保持启用**（临时注释掉只为配合 msSanitizer 复现越界，测完必须恢复）
+- [ ] 怀疑踩踏时跑 `verify_result.py --strict`（默认容差 `1e-4` 会掩盖轻微随机错）
 
 ---
 
@@ -918,13 +1060,16 @@ AscendDequant(dst, src, scale, {rowLen, colLen, scaleSize});          // A2/A3
 | 8 | `tileLength` 是否必须 32B 对齐 | ✅ 必须（8 的倍数）。bump 分配不做取整 ⇒ 后面 tensor 起点全错位 ⇒ `DataCopyPad` 违规 |
 | 9 | 尾块的补齐粒度 | ✅ `DataCopyPad` **只补到 32B**，不补到 `tileLength` ⇒ 行步长要用 `pitch`、计算长度用 `actualTileLength` |
 | 10 | 非对齐 N（`N%8!=0`）能否跑通 | ✅ 能。`N=7775`（tile 3 的 `actualTileLength=1631`）已实测通过，`blockCount=1` 平铺搬法**不需要行对齐**，`rightPadding=0` 即可 |
+| 11 | **L2 CacheMode（关 `xGm`）是否有效** | ✅ **有效，但依赖数据规模**：大 shape（x=254MB ≫ L2）**−23.0%**；小 shape（x=4MB ≪ L2）**+8.2%**（负优化）。判据见 ④ Step 4 |
+| 12 | **GROUP 是否真的减少了搬运笔数** | ✅ 是：`aiv_mte2_instructions` 从 817 降到 **169**（`group=5, tile=2048`） |
+| 13 | **UB 溢出会不会报错** | ✅ **跑到 UB 之外时 msSanitizer 能精确抓到**（地址/大小/源码行/调用栈全有），已实测复现 —— 见 ⓪ 节的实战案例；但**踩到相邻 tensor（仍在 UB 内）memcheck 可能抓不到**，需靠 `CheckUbBudget` + `verify --strict` |
 
 ### 12.2 仍待验证 / 未查清
 
 | # | 问题 | 怎么验证 |
 |---|---|---|
-| 1 | **GROUP 的实际收益**（笔数 ÷group 后时间降多少） | 采 `group=8`，看 `aiv_mte2_instructions` 是否 ÷8、`Task Duration` 降多少 |
-| 2 | **L2 CacheMode 的实际收益** | `l2=1` vs `l2=0` 同 shape 各采一次，看 `L2Cache.csv` 写命中率 |
+| 1 | **GROUP 的最优值**（`group` 从 1 扫到上限，收益拐点在哪） | `group=1/2/3/4/5`（`tile=2048` 时上限 5）各采一次，看 `Task Duration` 曲线 |
+| 2 | **`l2` 与 `group` 的交互** | 大 shape 下 `l2=0/1` × `group=1/5` 的 2×2 矩阵 |
 | 3 | **旧代码小 shape 的 ~115 μs 常数项是什么** | 旧版指令级数据里 `BAR` 占 VECTOR 55%。用 `core0.veccore0_code_exe.csv`（含源码行号）定位那 3 条 `BAR` 的来源 |
 | 4 | **`Process1()` 是否还需要** | 它当前无任何 kernel 调用（死代码）。确认无人依赖后删除 |
 | 5 | `aiv_mte2_time` 是否含 flag 等待 | 从指令级 cycles（49082）与 `aiv_mte2_time`（125 μs ≈ 225000 cycles）不一致可推断**含等待**，但需查 PMU 定义确认 |
