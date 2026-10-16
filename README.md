@@ -16,14 +16,14 @@ chmod +x build.sh
 ./build.sh help          # 打印全部子命令
 ```
 
-### 参数速查表（一次说清 6 个位置参数）
+### 参数速查表（一次说清 7 个位置参数）
 
 `run` / `prof` 的参数**完全一致**（`prof` 在末尾多一个可选的 `sim`）：
 
 ```bash
-./build.sh run  <M> <N> [tileLength] [l2] [db] [group]
-                  $1  $2      $3        $4   $5    $6
-# 等价于直接跑：./build/dequant <M> <N> [tileLength] [l2] [db] [group]
+./build.sh run  <M> <N> [tileLength] [l2] [db] [group] [hdsplit]
+                  $1  $2      $3        $4   $5    $6      $7
+# 等价于直接跑：./build/dequant <M> <N> [tileLength] [l2] [db] [group] [hdsplit]
 ```
 
 | 位置 | 参数 | 默认 | 含义 |
@@ -34,12 +34,18 @@ chmod +x build.sh
 | 4 | **`l2`** | 0 | 非 0 = **关闭 `xGm` 的 L2 Cache**（L2 优化开关）<br>⚠️ **大 shape 才有正收益**（−23%）；小 shape 反而变慢（+8.2%）——判据见 ④ Step 4 |
 | 5 | **`db`** | 0 | 非 0 = 启用**双缓冲**（Ping/Pong，x/y 各 2 份） |
 | 6 | **`group`** | 0 | **0 = 不用 GROUP 版**；>0 = 每批一次搬 `group` 行 |
+| 7 | **`hdsplit`** | 0 | 非 0 = 用 **`ProcessGroup2`（高维切分版）**，需要 `group > 0`。<br>见下方「⑤-B 高维切分广播版」 |
 
-**`l2` / `db` / `group` 是三个正交开关** ⇒ 可以任意组合，共 8 种配置。程序每次启动都会打印实际走的路径：
+**`l2` / `db` / `group` / `hdsplit` 是四个正交开关** ⇒ 可以任意组合，程序每次启动都会打印实际走的路径：
 
 ```
 [MODE] group+double_buffer (group=8 行/批, 2 份 buffer)  |  x 不走 L2
+[MODE] group2/hd-split (group=8 行/批, 高维切分+src1RepStride=0 广播)  |  x 不走 L2
+[MODE] group2+hd-split+double_buffer (group=8 行/批, 高维切分+src1RepStride=0 广播, 2 份 buffer)  |  x 不走 L2
 ```
+
+**`hdsplit` 与 `db` 可以叠加**：`hdsplit=1 db=1` 会走 `ProcessGroup2_DoubleBuffer`
+（高维切分的**指令折叠** + 双缓冲的**流水重叠**，两者收益来源不同，理论上可叠加 —— 但**尚未实测**）。
 
 > ⚠️ `l2` 的语义**变过**：早期它是"选一个叫 `dequant_custom_l2_cache` 的 kernel"（那个 kernel 只是再调一次 `Process2()`，**完全没有 L2 优化**，是空壳，现已删除）；现在是纯开关，位置不变。
 
@@ -497,6 +503,308 @@ API 见 [SetL2CacheHint.md](<asc-devkit/docs/zh/api/SIMD-API/basic_api/data_stru
 
 ---
 
+### ⑤-B 高维切分广播版（`ProcessGroup2`，`hdsplit=1`）
+
+> **状态：代码已就绪，尚未实机验证。** 见本节末尾「待验证项」。
+> （编号 ⑤-B 表示它是 ⑤ 的后续：⑤ 讲 tiling 与 UB 预算，本节讲计算阶段的指令折叠。）
+
+#### 6-1 它解决什么问题
+
+`ProcessGroup` 的计算是**逐行循环**：
+
+```cpp
+for (uint32_t row = 0; row < actualRow; row++) {
+    uint32_t Offset = row * pitch;
+    AscendC::Cast(yLocal[Offset], xLocal[Offset], ..., actualTileLength);
+    AscendC::Mul(yLocal[Offset], yLocal[Offset], sLocal, actualTileLength);   // ← 每行一条
+}
+```
+
+⇒ **`2 × actualRow` 条矢量指令**。
+
+`ProcessGroup2` 用**高维切分**把这个循环折进指令参数：
+
+```cpp
+for (uint32_t col = 0; col < actualTileLength; col += 64) {     // 列分段（mask 上限）
+    uint32_t seg = min(64, actualTileLength - col);
+    AscendC::Cast(yLocal[col], xLocal[col], ..., seg, actualRow,
+                  {1, 1, blkPerRow, blkPerRow});
+    AscendC::Mul(yLocal[col], yLocal[col], sLocal[col], seg, actualRow,
+                 {1, 1, 1, blkPerRow, blkPerRow, /*src1RepStride*/ 0});   // ★ 广播
+}
+```
+
+⇒ **`2 × ceil(N/64)` 条矢量指令**（与行数无关）。
+
+#### 6-2 广播原理
+
+依据官方 [`high_dim_split.md:73`](<asc-devkit/docs/zh/api/SIMD-API/basic_api/memory_vector_compute/SIMD_compute/high_dim_split.md#L73>)：
+
+> **反复计算场景：** repeatStride取值为0时，矢量计算单元会对**首个连续的8个DataBlock进行反复读取和计算**。
+
+`scale` 在 UB 里**只占一份**（`N × 4` 字节），乘 M 行时靠 `src1RepStride = 0` 让硬件**反复读同一段** ——
+**不需要 `Brcb`、不需要物理复制、零额外拷贝**。
+
+三层展开的对应关系：
+
+| 代码量 | 表达什么 | 展开成 |
+|---|---|---|
+| `repeatTime = actualRow` | 行方向 | `actualRow` 次迭代 |
+| `dstRepStride = src0RepStride = blkPerRow` | 每换一行 | 前进 `pitch` 个元素（= `pitch/8` 个 DataBlock） |
+| **`src1RepStride = 0`** | **scale 不换行** | **反复读 `sLocal[col..]` ⇒ 广播** |
+| 外层 `col` 循环 | 列方向分段 | `ceil(actualTileLength/64)` 段 |
+
+#### 6-3 参数怎么算：从 `pitch` 到 6 个 stride（**本节是核心**）
+
+高维切分的全部难度，集中在**把"第几行第几列"翻译成"DataBlock 步长"**。
+下面按顺序把每个量的来源和单位写清。
+
+##### ① 单位系统：一切以 DataBlock = 32B 为尺
+
+| 量 | 单位 | 说明 |
+|---|---|---|
+| `actualTileLength` | **元素** | 逻辑列宽 |
+| `pitch` | **元素** | `actualTileLength` 按 32B 向上取整后的**物理行宽** |
+| `blkPerRow = pitch / 8` | **DataBlock** | 一行占几个 32B 块（FP32 下 8 元素 = 1 块） |
+| `*BlkStride` | DataBlock | **迭代内**，相邻块之间的步长 |
+| `*RepStride` | DataBlock | **相邻迭代之间**，同名块之间的步长 |
+
+```cpp
+// dequant.asc 里的实际计算
+uint32_t pitch = (actualTileLength * 4 + 31) / 32 * 32 / 4;   // 元素
+const uint32_t blkPerRow = pitch / 8;                          // DataBlock
+```
+
+> **为什么必须用 `pitch` 而不是 `actualTileLength`**：`DataCopyPad` 会把行尾**补齐到 32B**
+> （见 [⑤ §5-2](#5-2-pitch-与-actualtilelength尾块只补到-32b不补到-tilelength)），
+> 所以 UB 里**真实的行间距**是 `pitch`。用 `actualTileLength` 换算会让**第二行起全部错位**。
+> `pitch * 4` 恒为 32 的倍数 ⇒ `pitch % 8 == 0` 恒成立 ⇒ 换算是干净的。
+
+##### ② 从"行列"到"6 个 stride"的推演
+
+设 FP32、`pitch = 64`（即 `blkPerRow = 8`）、`actualRow = 3`、`seg = 64`，UB 布局：
+
+```
+        DataBlock:   0    1    2    3    4    5    6    7  |  8    9  ...  15 | 16 ...
+                      └──────── row 0 (8 块 = 64 元素) ────┘ └── row 1 ─────┘ └ row 2
+sLocal:  [ s0  s1  s2 ... s63 ]      ← 只有一行，8 个块
+```
+
+`Mul(y, y, s, /*mask*/64, /*repeatTime*/3, {...})` 的**每次迭代**读 8 个块，于是：
+
+| 迭代 | `dst` 读哪 | `src0` 读哪 | `src1` 读哪 |
+|---|---|---|---|
+| 0 | 块 0–7（row 0） | 块 0–7（row 0） | 块 0–7（`s`） |
+| 1 | 块 8–15（row 1） | 块 8–15（row 1） | **块 0–7（同一个 `s`）** ★ |
+| 2 | 块 16–23（row 2） | 块 16–23（row 2） | **块 0–7（同一个 `s`）** ★ |
+
+要让"迭代间"落在上面这三行起点上：
+
+```cpp
+AscendC::BinaryRepeatParams{
+    /*dstBlkStride*/  1,          // 迭代内：8 个块紧挨着 → 正好一整行
+    /*src0BlkStride*/ 1,          // 同上
+    /*src1BlkStride*/ 1,          // 迭代内 s 也要连续读满一行（不能是 0！）
+    /*dstRepStride*/  blkPerRow,  // 换行：前进 8 个块 = 一整行
+    /*src0RepStride*/ blkPerRow,  // 同上
+    /*src1RepStride*/ 0           // ★★ 换行：前进 0 = 原地不动 ⇒ 反复读同一行 s
+};
+```
+
+**一句话记法**：
+
+> **`*BlkStride` 管"一行之内怎么走"，`*RepStride` 管"换行怎么走"。**
+> `src1RepStride = 0` 就是"`s` 不换行"，于是每行都复用同一份。
+
+##### ③ 为什么 `seg` 不能直接给 `actualTileLength`
+
+`mask` 一次迭代最多读 **256B**（[`Mul.md:89`](<asc-devkit/docs/zh/api/SIMD-API/basic_api/memory_vector_compute/basic_arithmetic/Mul.md#L89>)），FP32 即 **64 元素**。
+所以列方向必须**分段**，且**最后一段可能不足 64**：
+
+```cpp
+const uint32_t MASK_FP32 = 256 / sizeof(float);          // = 64
+for (uint32_t col = 0; col < actualTileLength; col += MASK_FP32) {
+    const uint32_t seg = (actualTileLength - col > MASK_FP32)
+                       ? MASK_FP32 : (actualTileLength - col);   // ← 尾段收缩
+    // 三个指针同步偏移 col，内层靠 RepStride 跨行
+    AscendC::Mul(yLocal[col], yLocal[col], sLocal[col], seg, actualRow, {...});
+}
+```
+
+**两层配合的分工**：
+
+| 层 | 负责 | 靠什么 |
+|---|---|---|
+| 外层 `col` 循环 | 列方向分段 | 三个指针**同步**偏移 `col` |
+| 内层 `repeatTime` | 行方向展开 | `*RepStride` 跨行、`src1RepStride=0` 广播 |
+
+> ⚠️ **尾段 `seg < 64` 时必须收缩**。若 `actualTileLength` 不是 64 的倍数（如 `1719`），
+> 无脑用 64 会**多算后面的脏数据** —— 结果虽然不会被写回 GM，但白做功，且可能踩到相邻 buffer。
+
+##### ④ 为什么 `Cast` 也要用高维切分，但参数不同
+
+`Cast` 是**一元**接口，用 `UnaryRepeatParams`（**4 个** stride，`UnaryRepeatParams.md:16-22`）：
+
+```cpp
+AscendC::Cast(yLocal[col], xLocal[col], AscendC::RoundMode::CAST_RINT, seg, actualRow,
+              AscendC::UnaryRepeatParams{ /*dstBlk*/1, /*srcBlk*/1,
+                                          /*dstRep*/blkPerRow, /*srcRep*/blkPerRow });
+```
+
+**与 `Mul` 的关键差异**：`Cast` **没有广播需求**（src/dst 一一对应），所以 `dstRep == srcRep == blkPerRow`，
+**不能也不需要**填 0。
+
+> **两个重载的字段数不同，别抄错**：
+> `UnaryRepeatParams` = 4 个（`dstBlk, srcBlk, dstRep, srcRep`）
+> `BinaryRepeatParams` = 6 个（`dstBlk, src0Blk, src1Blk, dstRep, src0Rep, src1Rep`）
+
+#### 6-4 ⚠️ 三个硬约束（都由 `uint8_t` 上限决定）
+
+[`BinaryRepeatParams.md:39`](<asc-devkit/docs/zh/api/SIMD-API/basic_api/aux_data_structures/BinaryRepeatParams.md#L39>) 明确：
+
+> 这些参数的类型是 `uint8_t`，故**最大值是 255**
+
+| # | 约束 | 上限 | 超限后果 | 拦截位置 |
+|---|---|---|---|---|
+| ① | `*RepStride` = `pitch/8` | **255** ⇒ `tileLength ≤ 2040` | **静默截断 → 结果错** | `CheckHdSplitBudget()` |
+| ② | `repeatTime = actualRow` | **255** ⇒ `group ≤ 255` | 回绕成 0 → **NOP，不计算** | 同上 |
+| ③ | `mask` 一次迭代 | **256B** ⇒ FP32 **64 个元素** | 编译错误 | 外层 `col` 分段（见 6-3 ③） |
+
+> **①是本节最阴的坑**：`main` 里把 `tileLength` 收窄到 **8192**，但高维切分版实际**只能用 ≤ 2040**。
+> 超了**不会报错**，而是把 `blkPerRow` 截断成 `blkPerRow % 256`（256 → **0**），
+> 结果就是"每行都读同一行" —— **算错但不报错**。
+> `CheckHdSplitBudget()`（`dequant.asc:938`）在 `aclInit` 之前**提前拒绝**并打印可用上界。
+
+**约束①的推导链**（可自行验算）：
+
+```
+blkPerRow = pitch/8 ≤ 255
+        ⇒ pitch ≤ 2040                （元素）
+        ⇒ pitch*4 ≤ 8160 字节
+        ⇒ actualTileLength ≤ 2040     （pitch 是它向上取整到 8 的结果）
+        ⇒ tileLength ≤ 2040
+```
+
+##### ⚠️ 一个会干扰实验的细节：`tileLength > N` 时会被"保守拒绝"
+
+`CheckHdSplitBudget` 用 **`tileLength`** 算上界（`dequant.asc:961`）：
+
+```cpp
+const uint32_t maxPitch = (tileLength * 4u + 31u) / 32u * 32u / 4u;
+```
+
+而 kernel 里真实的 `pitch` 来自 `actualTileLength = min(tileLength, N - j*tileLength)`。
+**host 侧算的是上界，方向安全，但会偏保守**：
+
+| 场景 | host 侧 `blkPerRow` | 真实 `blkPerRow` | 结果 |
+|---|---|---|---|
+| `N=1024, tileLength=2048` | 256 | **128**（`actualTileLength=1024`） | ❌ **被拒绝，但其实合法** |
+| `N=7775, tileLength=2048` | 256 | 256 | ❌ 拒绝，确实非法 |
+
+> **做对比实验时注意**：`tileLength > N` 的情况下被拒绝，**不代表这个 `tileLength` 真的不可用**。
+> 若要放行这类边界，可把 host 侧的上界改成 `min(tileLength, N)` ——
+> 但**当前保持保守**，因为"被拒绝"远好于"静默算错"。
+
+##### 为什么不在 kernel 里也加运行期守卫
+
+kernel 里的运行期检查（`dequant.asc:391-399`）**已注释掉**，理由：
+
+1. **host 侧拦截是充分的** —— `maxPitch` 是上界，覆盖所有 `j`；`actualRow ≤ group`，而 `group > 255` 也判了
+2. 守卫在**内层循环里**，每轮都判一次，纯属浪费（`blkPerRow` 只随 `j` 变、`actualRow` 只随 `row0` 变）
+3. **保留它是为了"想看真实截断行为"时临时放开**
+
+> ⚠️ **若要观察静默截断**：需**同时**放开两处才看得到 ——
+> ① kernel 守卫（`dequant.asc:391-399`）② host 侧 `CheckHdSplitBudget` 调用（`dequant.asc:1036`）。
+> 只放开 ①仍然会在 host 侧被拒，**因为 `CheckHdSplitBudget` 在 `aclInit` 之前就 return 了**。
+> 观察完**务必恢复 ②**。
+
+#### 6-5 ⚠️ 另一个容易错的地方：`Cast` 的 src/dst 步长可能不同
+
+[`Cast.md:361`](<asc-devkit/docs/zh/api/SIMD-API/basic_api/memory_vector_compute/type_conversion/Cast.md#L361>)：
+
+> 当源操作数和目的操作数位数不同时，计算输入参数以数据类型的**字节较大**的为准。例如，源操作数为 half 类型，
+> 目的操作数为 int32_t 类型时，每次迭代最多操作 64 个元素，为保证输出和输入是连续的，
+> **dstRepStride 应设置为 8，srcRepStride 应设置为 4**。
+
+本算子 `int32_t → float` **两者同为 4B**，所以 `dstRepStride == srcRepStride == blkPerRow` ✅
+
+> **将来若改 dtype（如 `int8 → float32`），两者必须分开算！** 这是隐藏的坑。
+
+#### 6-6 预期的指令数收益（**不等于**端到端收益）
+
+以 `M=8175, N=7775, tileLength=2048` 为例，每核 `singleCoreM ≈ 204`：
+
+| | 每核 `Mul` 条数 |
+|---|---|
+| `ProcessGroup` | **204** |
+| `ProcessGroup2` | `ceil(1631/64)` = **26** |
+
+**约 8× 指令数下降**（不是 32× —— `N > 64` 的列分段吃掉了大部分）。
+
+⚠️ **但端到端提升可能很小**，因为瓶颈不在 Vector：
+
+| 指标 | 大 shape 双缓冲（见 ④ Step 2） |
+|---|---|
+| `aiv_vec_time` | 81.09 μs |
+| `aiv_time` | 484.23 μs |
+| **Vector 占比** | **≈ 17%** |
+| `aiv_mte2_time / aiv_time` | **0.967** ← MTE2 是瓶颈 |
+
+**Amdahl 上限 17%**，而这只是减少**指令下发**，Vector 单元实际计算时间未必降多少。
+
+#### 6-7 用法
+
+```bash
+# 老版（逐行循环）—— 基线
+./build.sh run 1024 1024 2048 0 0 8
+
+# 高维切分（单缓冲）
+./build.sh run 1024 1024 2048 0 0 8 1
+
+# 高维切分 + 双缓冲（指令折叠 + 流水重叠）
+./build.sh run 1024 1024 2048 0 1 8 1
+```
+
+⚠️ **`tileLength` 必须 ≤ 2040**（见 6-3 约束①）。上面示例用 2048 **会被 `CheckHdSplitBudget` 拒绝**，请改成 2032 / 2040：
+
+```bash
+./build.sh run 1024 1024 2032 0 0 8 1     # ✅ 单缓冲
+./build.sh run 1024 1024 2032 0 1 8 1     # ✅ 双缓冲
+./build.sh run 1024 1024 2048 0 0 8 1     # ❌ 报错：blkPerRow=256 > 255
+```
+
+**对比实验必须同 `tileLength`** —— 拿 `2032` 的高维切分版去比 `2048` 的逐行版，
+测出来的是 **tiling 变化**，不是指令折叠的收益。
+
+#### 6-8 待验证项（诚实声明）
+
+| 项 | 状态 |
+|---|---|
+| **`src1RepStride = 0` 在 A2 上是否真是"原地不动"** | ✅ **已用 `probe_s1reps0/` 实测通过** —— `src1RepStride=0` 时两行输出均为 `[1..8]`，广播成立 |
+| 编译是否通过 | ⏳ 未编译（本机无 NPU 环境） |
+| `ProcessGroup2` 精度是否与 `ProcessGroup` 一致 | ⏳ 未运行 |
+| `ProcessGroup2_DoubleBuffer` 精度 | ⏳ 未运行 |
+| 实际指令数 / 耗时收益 | ⏳ 未采集 |
+| 双缓冲与高维切分收益能否叠加 | ⏳ 未实测。两者来源不同（一个省指令、一个提重叠），理论上可叠加，但 Vector 只占 17% ⇒ 预期幅度有限 |
+
+#### 6-9 `probe_s1reps0/` —— 广播语义验证（**已通过**）
+
+`probe_s1reps0/` 是一个**独立的极小工程**，专门验证 `src1RepStride = 0` 的语义：
+
+```
+输入：x = 全 1 (2 行 × 8 列)，s = [1,2,3,4,5,6,7,8]
+操作：Mul(d, x, s, mask=8, repeatTime=2, {1,1,1,1,1,src1RepStride})
+判据：src1RepStride=0 时两行输出都应等于 [1..8]
+```
+
+**结论**：✅ **通过**。`src1RepStride=0` 确实是"原地不动、反复读同一段"，
+即官方 [`high_dim_split.md:73`](<asc-devkit/docs/zh/api/SIMD-API/basic_api/memory_vector_compute/SIMD_compute/high_dim_split.md#L73>) 所说的"反复计算场景"。
+
+**这条是整个 `ProcessGroup2` 的地基** —— 项目里的 `probe_s1reps0/` 保留了该验证工程，
+后续若换硬件/换 CANN 版本，建议**重跑一次**确认语义未变。
+
+---
+
 ### ⑤ tile 参数对齐 与 UB 校验函数设计
 
 > 这一节是代码里最容易踩坑、也最需要在 README 里说清的部分。
@@ -759,18 +1067,28 @@ $$
 
 （框架口径也把它归为 elementwise：PyTorch 的 `TensorIterator` 就是统一处理 elementwise + broadcast 的。）
 
-### 3.3 广播在 UB 里怎么落地（两种策略）
+### 3.3 广播在 UB 里怎么落地（三种策略）
 
 要算 `Mul`，两个操作数的**布局必须一致**。可行的做法：
 
-| 策略 | 做法 | UB 开销 | 评价 |
-|---|---|---|---|
-| **A. 物理广播** | 把 `scale[N]` 在 UB 里**复制 M 份**，得到 `[M,N]` | $M\cdot N \cdot 4$ B | ❌ 与 x 同量级，白吃 UB |
-| **B. 分块复用（推荐）** | 按行/按块处理，每块只取对应的 $s$ 段 | 只要 $N\cdot 4$ B | ✅ **常驻 + 复用** |
-| **C. 硬件广播读** | 用 `DataCopyExtParams{blockCount=M, srcStride=?}` 在**搬运时就重复读**同一段 GM | $M\cdot N\cdot 4$ B | ⚠️ 省了 UB 内复制，但 UB 仍占满 |
+| 策略 | 做法 | UB 开销 | 指令数 | 评价 |
+|---|---|---|---|---|
+| **A. 硬件广播读** ⭐ | `Mul` 高维切分，**`src1RepStride = 0`** ⇒ 硬件每次迭代反复读同一段 | 只要 $N\cdot 4$ B ✅ | `ceil(N/64)` ✅ | ✅ **最优**：零额外拷贝、指令最少 → 见 [§6.2 路线①](#62-广播落地三种实现路线按推荐度) |
+| **B. 分块复用** | 逐行循环，每行只取对应的 $s$ 段 | 只要 $N\cdot 4$ B ✅ | $M$ ❌ | ✅ **保底**（不受对齐约束）；**当前实现用的是这个** |
+| **C. 物理广播** | 把 `scale[N]` 在 UB 里**复制 M 份**，得到 `[M,N]` | $M\cdot N \cdot 4$ B ❌ | 1 ✅ | ❌ 与 x 同量级，白吃 UB |
 
-**结论：选 B。** `scale` 全流程**只从 GM 搬一次**、常驻 UB，之后每行复用。
-这正好是"广播算子"的通用优化手法：**把"重复读"变成"读一次 + 常驻"**。
+**结论：首选 A，保底 B。** 两者都保证 `scale` 全流程**只从 GM 搬一次**、常驻 UB（$N\cdot4$ 字节），
+区别只在**计算阶段怎么让硬件复用这份常驻数据**：
+
+- **A**（`src1RepStride=0`）：让硬件**反复读**，一条指令算完一批行 → **`ProcessGroup2`**
+- **B**（逐行循环）：软件多次调用，每次读同一段 → **`ProcessGroup`**
+
+> 💡 **通用原则**：把"重复读"变成"**读一次 + 常驻 + 硬件反复读**"。
+> §④ Step 1 的 `scale` 常驻优化（`read_main` 205→107.8 KB，−47.5%）就是这个原则的搬运侧体现。
+
+> ⚠️ **早先版本把"搬运期广播"（原策略 C）列为候选，现已移除**：
+> 它需要 `srcStride = -blockLen`（负值），而 A2/`dav-2201` 的 `srcStride` 是 `uint32_t`（无符号），
+> **类型上就填不了负值**，且官方标注为 950 专属。详见 [§6.2 末尾的说明](#62-广播落地三种实现路线按推荐度)。
 
 ---
 
@@ -869,21 +1187,34 @@ Mul(dstFp32Tile, dstFp32Tile, scaleBroadcastTile, tileElems);
 | API | 作用 | 备注 |
 |---|---|---|
 | `DataCopy` / `DataCopyPad` | GM ↔ UB | 尾块/非对齐必须用 `DataCopyPad` |
-| `Cast` | int32 → float32 | 有舍入模式参数 |
-| `Mul` | 逐元素乘 | 两操作数布局必须一致 |
+| `Cast` | int32 → float32 | 有舍入模式参数；也有高维切分重载（`UnaryRepeatParams`） |
+| `Mul` | 逐元素乘 | 两操作数布局必须一致；有高维切分重载（`BinaryRepeatParams`） |
 | `Sub` | 逐元素减 | 仅非对称版需要 |
-| `Duplicate` | 标量填充 | 构造全 0 offset（官方样例用它造 offset） |
-| `Brcb` / `Copy` 的 stride 模式 | **构造广播布局** | ⚠️ 语义需查各自 README 后定 |
+| `Duplicate` | **标量**填充 | 只能填一个标量值 ⇒ 做不了 per-channel 广播（那是 per-tensor 场景） |
+
+> ⚠️ **`Brcb` 不能用做本算子的广播**：它的语义是"**1 个元素 → 填满 1 个 32B DataBlock**"（放大 8×/16×），
+> 而本算子要的是"**1 行 → 重复 M 行**"，**方向相反**。官方用途是"常量填充、掩码生成"。
+> 详见 [`brcb/README.md`](<asc-devkit/examples/01_simd_cpp_api/03_basic_api/01_memory_vector_compute/brcb/README.md#L5>)
+> 与 [§12.1 问题 #3](#121-已在本项目中验证有实测或源码文档依据)。
 
 ### 6.2 广播落地：三种实现路线（按推荐度）
 
-| 路线 | 做法 | 优点 | 缺点 |
-|---|---|---|---|
-| **① 按行循环** | 外层循环 M 行，每行 `Mul(row, row, scaleTile)` | scale 只占 $N\cdot4$ B；逻辑最直白 | 行数多时标量开销大（每行一次 Mul 的 repeat 开销） |
-| **② 块内重复构造** | 把 `scale` 在 UB 内按块重复到与 tile 同高，再一次 `Mul` | 一次 Mul 算完，指令少 | 需要重复构造的机制（`Brcb`/`Copy` stride），UB 多占 |
-| **③ 搬运期广播** | `DataCopyExtParams` 用 `blockCount=M` + 重复读同一段 GM | 少一步 UB 内构造 | ⚠️ 需验证 stride 语义；UB 仍占满 |
+| 路线 | 做法 | UB 占用 | 指令数 | 评价 |
+|---|---|---|---|---|
+| **① `src1RepStride = 0`** ⭐ | `Mul` 高维切分，换行步长给 dst/src0，**`src1RepStride` 给 0** | $N\cdot4$ ✅ | `ceil(N/64)` ✅ | **首选**：零额外拷贝、指令最少。依据 [`high_dim_split.md:73`](<asc-devkit/docs/zh/api/SIMD-API/basic_api/memory_vector_compute/SIMD_compute/high_dim_split.md#L73>) |
+| **② 按行循环** | 外层循环 M 行，每行 `Mul(row, row, scaleTile)` | $N\cdot4$ ✅ | `M` ❌ | **保底**：逻辑最直白、不受 8 倍数/64 元素约束。**当前 `ProcessGroup` 用的就是这个** |
+| **③ 物理物化** | 把 `scale` 在 UB 内复制成 `[M,N]`，再逐元素算 | $M\cdot N\cdot4$ ❌ | 1 ✅ | **不推荐**：白吃 UB，与 x 同量级 |
 
-**建议**：**先做 ①**（最短路径跑通精度），再用 profiling 判断"标量开销是否成为瓶颈"，需要时换 ②。
+**结论**：**① 是这一场景的最优解，② 是保底**。
+本项目的执行顺序正好是"先 ② 跑通精度 → 再上 ①"，
+① 的实现即 **`ProcessGroup2`**（见 [⑤-B 节](#-b-高维切分广播版processgroup2hdsplit1)），
+
+> 💡 **通用原则**：把"重复读"变成"**读一次 + 常驻 + 硬件反复读**"。
+> 这也是 §④ Step 1（`scale` 常驻 UB）的理论基础 —— 那条优化的实测收益是 `read_main` 205→107.8 KB（−47.5%）。
+
+> ⚠️ **③ 搬运期广播在本平台不可用**：`DataCopyPad` 的"重复搬运同一块"需要 `srcStride = -blockLen`（负值），
+> 而 A2/`dav-2201` 的 `srcStride` 是 **`uint32_t`（无符号）**，**类型上就填不了负值**；
+> 该用法官方标注为 **950 专属**。详见 [`DataCopyPad_GMToUB.md:177`](<asc-devkit/docs/zh/api/SIMD-API/basic_api/memory_vector_compute/data_move/DataCopyPad_GMToUB.md#L177>)。
 
 ---
 
@@ -1063,6 +1394,12 @@ AscendDequant(dst, src, scale, {rowLen, colLen, scaleSize});          // A2/A3
 | 11 | **L2 CacheMode（关 `xGm`）是否有效** | ✅ **有效，但依赖数据规模**：大 shape（x=254MB ≫ L2）**−23.0%**；小 shape（x=4MB ≪ L2）**+8.2%**（负优化）。判据见 ④ Step 4 |
 | 12 | **GROUP 是否真的减少了搬运笔数** | ✅ 是：`aiv_mte2_instructions` 从 817 降到 **169**（`group=5, tile=2048`） |
 | 13 | **UB 溢出会不会报错** | ✅ **跑到 UB 之外时 msSanitizer 能精确抓到**（地址/大小/源码行/调用栈全有），已实测复现 —— 见 ⓪ 节的实战案例；但**踩到相邻 tensor（仍在 UB 内）memcheck 可能抓不到**，需靠 `CheckUbBudget` + `verify --strict` |
+| 14 | **`repeatStride = 0` 的官方语义** | ✅ 官方明确：`high_dim_split.md:73` "repeatStride取值为0时，矢量计算单元会对**首个连续的8个DataBlock进行反复读取和计算**"；`high_dim_split.md:54` 另有迭代内版本"`srcBlkStride=0` ⇒ 源操作数始终复用第一个DataBlock" |
+| 15 | **`Mul` / `Cast` 是否有高维切分重载** | ✅ 都有。`Mul.md:69` 收 `BinaryRepeatParams`（6 个 stride）；`Cast.md:61` 收 `UnaryRepeatParams`（4 个 stride） |
+| 16 | **`*RepStride` 的取值范围** | ✅ **`uint8_t`，上限 255**（`BinaryRepeatParams.md:39`）。⇒ 高维切分版 `tileLength ≤ 2040`，**比 `main` 里收窄的 8192 小得多**，超限会被**静默截断** |
+| 17 | **`repeatTime` 的取值范围** | ✅ `uint8_t`，上限 255（`high_dim_split.md:28`）。⚠️ **超限回绕成 0 ⇒ 视为 NOP（不计算、不报错）**（`Mul.md:132`） |
+| 18 | **`mask` 一次迭代的上限** | ✅ **256B**（`Mul.md:89`）⇒ FP32 最多 **64** 个元素。超过必须外层按列分段 |
+| 19 | **`Cast` 的 src/dst 步长能否相同** | ✅ **同字节宽度时可以**（int32→float 都是 4B）。⚠️ 但 `Cast.md:361` 规定"位数不同时以字节较大者为准"，half→int32 时 dstRep=8 / srcRep=4 ⇒ **换 dtype 必须分开算** |
 
 ### 12.2 仍待验证 / 未查清
 
@@ -1073,6 +1410,10 @@ AscendDequant(dst, src, scale, {rowLen, colLen, scaleSize});          // A2/A3
 | 3 | **旧代码小 shape 的 ~115 μs 常数项是什么** | 旧版指令级数据里 `BAR` 占 VECTOR 55%。用 `core0.veccore0_code_exe.csv`（含源码行号）定位那 3 条 `BAR` 的来源 |
 | 4 | **`Process1()` 是否还需要** | 它当前无任何 kernel 调用（死代码）。确认无人依赖后删除 |
 | 5 | `aiv_mte2_time` 是否含 flag 等待 | 从指令级 cycles（49082）与 `aiv_mte2_time`（125 μs ≈ 225000 cycles）不一致可推断**含等待**，但需查 PMU 定义确认 |
+| 6 | **`Mul` + `src1RepStride = 0` 是否真等于广播** ⭐ | ✅ **已实测通过** —— `probe_s1reps0/` 独立工程验证：`src1RepStride=0` 时两行输出均为 `[1..8]`，广播成立。见 [⑤-B §6-9](#6-9-probe_s1reps0--广播语义验证已通过) |
+| 7 | **`ProcessGroup2` / `ProcessGroup2_DoubleBuffer` 的精度与性能** | ⏳ 未编译、未运行。→ `./build.sh run 1024 1024 2032 0 0 8 1` vs `... 8`（**注意 tileLength ≤ 2040**）；采 `PipeUtilization` 看 `aiv_vec_time` 是否下降、搬运字节是否不变 |
+| 8 | **A2 上 `Broadcast` 静态接口 axis=1 的对齐要求** | ⚠️ 文档冲突：`Broadcast.md:171` 把"`srcShape[0]` 需 32B 对齐"标注为 **310p 专有**，而 `ub-broadcast.md:134` 列为通用约束。**本地无法裁决**，需实测或查 CANN 安装目录内的对应版本文档 |
+| 9 | **高维切分与双缓冲的收益能否叠加** | ⏳ 未实测。`hdsplit=1 db=1` 走 `ProcessGroup2_DoubleBuffer`。两者收益来源不同（省指令 vs 提重叠），但 Vector 仅占 `aiv_time` 的 17% ⇒ 预期幅度有限 |
 
 ---
 
